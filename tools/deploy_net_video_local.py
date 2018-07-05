@@ -18,6 +18,7 @@ import datetime
 import os
 import math
 import cv2
+import random
 from sets import Set
 from collections import defaultdict
 
@@ -41,6 +42,8 @@ logger = logging.getLogger(__name__)
 length = 8 
 stride = 8
 width, height = (224, 224)
+scale_w, scale_h = (320, 256)
+crop_size = 224
 #------------------------------------------------------
 
 
@@ -81,6 +84,11 @@ def init_net():
         use_cudnn=True, cudnn_exhaustive_search=True,
         split=cfg.TEST.DATA_TYPE)
     test_model.build_model()
+    
+    if cfg.PROF_DAG:
+        test_model.net.Proto().type = 'prof_dag'
+    else:
+        test_model.net.Proto().type = 'dag'
 
     workspace.RunNetOnce(test_model.param_init_net)
     net = test_model.net
@@ -103,7 +111,6 @@ def init_net():
 
 def predict(i3d, clip):
     # clip = np.zeros([1,3,8,224,224]
-    clip = (clip - cfg.MODEL.MEAN) / cfg.MODEL.STD
     device_opts = caffe2_pb2.DeviceOption()
     device_opts.device_type = caffe2_pb2.CUDA
     device_opts.cuda_gpu_id = 0
@@ -117,9 +124,39 @@ def predict(i3d, clip):
     return pred, conf 
 
 def collect_clip(cap):
-    # stride = cfg['stride']
-    # length = cfg['length']
-    # width, height = cfg['input_size']
+    # customized_video_input_op.h:206,  scale
+    def _scale(frame, size=(320, 256)):
+        return cv2.resize(frame, size)
+    
+    # customized_video_input_op.h:208,210,  crop
+    def _crop(frame, crop_size=224, type='random'):
+        # type: {'random', 'center'}
+        h, w  = frame.shape[:2]
+        if type == 'random':
+            x = random.randint(crop_size//2, w-crop_size//2-1)
+            y = random.randint(crop_size//2, h-crop_size//2-1)
+        elif type == 'center':
+            x = w//2
+            y = h//2
+        else:
+            logger.warning('unknow type, use center crop instead')
+            x = w//2
+            y = h//2
+        return frame[y-crop_size//2:y+crop_size//2, x-crop_size//2:x+crop_size//2, :]
+    
+    # customized_video_input_op.h:211,212,  sampling
+    # @sa: deploy_net_video_local:collect_clip()
+    
+    # customized_video_input_op.h:213,  normalize
+    def _normalize(clip, mean=128, std=1):
+        # just do it over clip
+        return (clip-mean)/std
+        
+    # customized_video_input_op.h:219,   channel_swap
+    def _channel_swap(frame, use_bgr=True):
+        if use_bgr:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
 
     '''
     clip = np.ndarray(1, [3, length, width, height], dtype=np.float)
@@ -135,17 +172,22 @@ def collect_clip(cap):
         frame_index += 1
         if not (frame_index+1) % stride == 0:
             continue
-        frame = cv2.resize(frame, (width, height))
+        frame = _scale(frame, (scale_w, scale_h))
+        frame = _crop(frame, crop_size=crop_size)
+        frame = _channel_swap(frame)
         '''
         clip[0, 0, (frame_index+1)//stride-1, ...] = frame[..., 0]
         clip[0, 1, (frame_index+1)//stride-1, ...] = frame[..., 1]
         clip[0, 2, (frame_index+1)//stride-1, ...] = frame[..., 2]
         if (frame_index+1)//stride == length:
-            return clip
+            return _normalize(clip, mean=cfg.MODEL.MEAN, std=cfg.MODEL.STD)
         '''
+        # below 4 lines is numpy implementation of temporal stack, in place of commentted lines above.
+        # note the clip initialization before loop is diffrenet too. 
         clip.append(frame.transpose([2, 0, 1]))
         if len(clip) == length:
-            return np.array(clip).reshape([-1, length, 3, width, height]).transpose([0, 2, 1, 3, 4])
+            clip = np.array(clip).reshape([-1, length, 3, width, height]).transpose([0, 2, 1, 3, 4])
+            return _normalize(clip, mean=cfg.MODEL.MEAN, std=cfg.MODEL.STD)
 
 def action_recognition(i3d, cap):
     clip = collect_clip(cap)
